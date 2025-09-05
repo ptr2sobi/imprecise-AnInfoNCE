@@ -573,8 +573,129 @@ class AnInfoNCELoss(CLLoss):
         loss_pos_mean, loss_neg_mean = torch.mean(loss_pos), torch.mean(loss_neg)
     
         return loss_mean, loss, [loss_pos_mean, loss_neg_mean]
-    
-    
+
+class ImpreciseInfoNCELoss(CLLoss):
+    """Imprecise InfoNCE with adversarial box-constrained negative mixture.
+
+    Per-sample objective (robust one-term form):
+      phi(i) = log( exp(z_pos + log gamma_max) + sum_j w*_j exp(z_neg_j) ) - (z_pos + log gamma_max),
+    where w* maximizes the inner linear objective over the box-constrained simplex
+    alpha <= w_j <= beta, sum_j w_j = 1.
+
+    Args:
+        tau: Temperature scaling.
+        alpha: Lower bound for each negative weight.
+        beta: Upper bound for each negative weight.
+        gamma_max: Optimistic positive prior weight (>=1).
+        normalize: L2-normalize representations before similarity.
+        stop_grad_inner: Do not backprop through the inner argmax weights.
+    """
+
+    def __init__(
+        self,
+        tau: float = 1.0,
+        alpha: float = 0.0,
+        beta: float = 1.0,
+        gamma_max: float = 1.0,
+        normalize: bool = True,
+        stop_grad_inner: bool = True,
+    ):
+        self.tau = tau
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma_max = gamma_max
+        self.normalize = normalize
+        self.stop_grad_inner = stop_grad_inner
+
+    def loss(self, z1, z2_con_z1, z3, z1_rec, z2_con_z1_rec, z3_rec):
+        del z1, z2_con_z1, z3, z3_rec
+
+        device = z1_rec.device
+
+        # Build 2B batch: first B anchors, next B their positives (SimCLR pairing)
+        A = torch.cat([z1_rec, z2_con_z1_rec], dim=0)
+
+        if self.normalize:
+            A = A / (torch.norm(A, p=2, dim=-1, keepdim=True) + 1e-12)
+
+        B2 = A.size(0)
+        assert B2 % 2 == 0
+        B = B2 // 2
+
+        # Similarity logits
+        logits = torch.einsum("ij,kj->ik", A, A) / self.tau
+
+        # Positive index mapping: i <-> i^+, where i^+ = i +/- B
+        pos_idx = torch.arange(B2, device=device)
+        pos_idx[:B] += B
+        pos_idx[B:] -= B
+
+        # Masks
+        eye = torch.eye(B2, dtype=torch.bool, device=device)
+        pos_mask = F.one_hot(pos_idx, num_classes=B2).bool()
+        neg_mask = ~(eye | pos_mask)
+
+        K = B2 - 2  # number of negatives per anchor
+
+        # Feasibility check for (alpha, beta)
+        if not (K * self.alpha <= 1.0 + 1e-9 and 1.0 <= K * self.beta + 1e-9):
+            raise ValueError(
+                f"Infeasible (alpha, beta) for K={K}: need K*alpha <= 1 <= K*beta."
+            )
+
+        # Gather positives and negatives
+        z_pos_vec = logits[torch.arange(B2, device=device), pos_idx]
+        z_negs = logits[neg_mask].view(B2, K)
+
+        # Inner maximizer w* under box constraints (vectorized greedy)
+        idx_sorted = torch.argsort(z_negs, dim=1, descending=True)
+
+        rem = float(1.0 - K * self.alpha)
+        cap = float(self.beta - self.alpha)
+        if cap <= 0.0 or rem <= 0.0:
+            w_star = torch.full_like(z_negs, fill_value=self.alpha)
+            if rem > 1e-12:
+                w_star[:, -1] = w_star[:, -1] + rem
+        else:
+            M = int(min(K, np.floor(rem / cap)))
+            remainder = float(rem - M * cap)
+
+            w_sorted = torch.full_like(z_negs, fill_value=self.alpha)
+            if M > 0:
+                w_sorted[:, :M] = w_sorted[:, :M] + cap
+            if (M < K) and (remainder > 1e-12):
+                w_sorted[:, M] = w_sorted[:, M] + remainder
+
+            w_star = torch.zeros_like(z_negs)
+            w_star.scatter_(1, idx_sorted, w_sorted)
+
+        if self.stop_grad_inner:
+            w_star = w_star.detach()
+
+        log_gamma = float(torch.log(torch.tensor(self.gamma_max, device=device)))
+
+        # Compute robust loss per anchor
+        log_w = torch.log(w_star + 1e-20)
+        denom = torch.logsumexp(
+            torch.cat(
+                [
+                    (z_pos_vec + log_gamma).unsqueeze(1),
+                    z_negs + log_w,
+                ],
+                dim=1,
+            ),
+            dim=1,
+        )
+        loss_per_item = denom - (z_pos_vec + log_gamma)
+
+        loss_mean = torch.mean(loss_per_item)
+
+        loss_pos_mean = torch.mean(-(z_pos_vec + log_gamma))
+        loss_neg_mean = torch.mean(denom)
+
+        return loss_mean, loss_per_item, [loss_pos_mean, loss_neg_mean]
+
+
 def _logmeanexp(x, dim):
     # do the -log thing to use logsumexp to calculate the mean and not the sum
     # as log sum_j exp(x_j - log N) = log sim_j exp(x_j)/N = log mean(exp(x_j)
